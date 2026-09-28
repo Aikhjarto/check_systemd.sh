@@ -2,166 +2,195 @@
 # Copyright (C) Thomas Wagner <wagner-thomas@gmx.at>
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-set -o errexit
-
 
 NAG_OK=0
 NAG_WARN=1
 NAG_CRIT=2
 NAG_UNKNOWN=3
 
-FAILED_UNITS_STR=""
-NUM_FAILED=0
-STATUS_STR=OK
-RET_VAL=$NAG_OK
-REMOTE_HOST='localhost'
+REMOTE_HOST=""
 BOOT_TIME_WARN_SEC=300
 BOOT_TIME_CRIT_SEC=600
-BOOT_TIME_STR=""
-
+SSH_TIMEOUT=10
 USE_SSH=""
-
-trap "echo 'UNKNOWN - '; exit $NAG_UNKNOWN" EXIT
+REQUIRED_SERVICES=()
 
 print_usage(){
 cat <<EOF
 This script checks status of systemd and reports boot time as well as failed services.
- Usage: check_systemd -H hostname -c TIME -w TIME [-s] [
--H [USER@]HOSTNAME      Connection information, where HOSTNAME can be an IP adress too
--w T                    If boot took longer than T seconds (no decimal notation allowed), status is reported as WARNING.
--c T                    If boot took longer than T seconds (no decimal notation allowed), status is reported as CRITICAL.
+ Usage: check_systemd.sh [-H [USER@]HOSTNAME] [-s] [-t T] [-w T] [-c T] [-a servicename]...
+-H [USER@]HOSTNAME      Connection information, where HOSTNAME can be an IP adress too. Without -H, the local systemd is checked.
+-w T                    If boot took longer than T seconds (no decimal notation allowed), status is reported as WARNING (default 300).
+-c T                    If boot took longer than T seconds (no decimal notation allowed), status is reported as CRITICAL (default 600).
 -s                      Use ssh to connect instead of -H option from systemd, since -H can trigger errors like 'Failed to send message: Transport endpoint is not connected' in some versions of systemd.
+-t T                    With -s, give up connecting after T seconds (default 10).
 -a servicename          Name of units that need to be running. Can be given multiple times. "servicename" is without the suffix ".service". If any service given with -a is not running, status is reported as CRITICAL.
+-h                      Show this help.
 EOF
 }
 
+# prints the plugin output and exits
+# unknown MESSAGE
+unknown(){
+	echo "UNKNOWN - $1"
+	exit $NAG_UNKNOWN
+}
 
-while getopts "H:w:c:sa:h" opt; do
-        case $opt in 
-                H) 
-                        REMOTE_HOST=$OPTARG
-                        ;;
-                w)
-                        BOOT_TIME_WARN_SEC=$OPTARG
-                        ;;
-                c)
-                        BOOT_TIME_CRIT_SEC=$OPTARG
-                        ;;
-                s)
-                        USE_SSH="y"
-                        ;;
-                a)
-                        multi+=("$OPTARG")
-                        ;;
-                h)
-                        print_usage
-                        trap "" EXIT
-                        exit $NAG_UNKNOWN
-                        ;;
-                ?)
-                        echo "Invalid options $opt"
-                        print_usage
-                        trap "" EXIT
-                        exit $NAG_UNKNOWN
-                        ;;
-        esac
+is_integer(){
+	[[ "$1" =~ ^[0-9]+$ ]]
+}
+
+
+while getopts ":H:w:c:st:a:h" opt; do
+	case $opt in
+		H)
+			REMOTE_HOST=$OPTARG
+			;;
+		w)
+			BOOT_TIME_WARN_SEC=$OPTARG
+			;;
+		c)
+			BOOT_TIME_CRIT_SEC=$OPTARG
+			;;
+		s)
+			USE_SSH="y"
+			;;
+		t)
+			SSH_TIMEOUT=$OPTARG
+			;;
+		a)
+			REQUIRED_SERVICES+=("${OPTARG%.service}")
+			;;
+		h)
+			print_usage
+			exit $NAG_UNKNOWN
+			;;
+		:)
+			echo "UNKNOWN - option -$OPTARG needs an argument"
+			print_usage
+			exit $NAG_UNKNOWN
+			;;
+		?)
+			echo "UNKNOWN - invalid option -$OPTARG"
+			print_usage
+			exit $NAG_UNKNOWN
+			;;
+	esac
 done
 
-if [ -n "${USE_SSH}" ]; then
-        SYSTEMD_ANALYZE_BIN="ssh ${REMOTE_HOST} systemd-analyze"
-        SYSTEMCTL_BIN="ssh ${REMOTE_HOST} systemctl"
-else
-        SYSTEMD_ANALYZE_BIN="systemd-analyze -H ${REMOTE_HOST}"
-        SYSTEMCTL_BIN="systemctl -H ${REMOTE_HOST}"
+for VALUE in "$BOOT_TIME_WARN_SEC" "$BOOT_TIME_CRIT_SEC" "$SSH_TIMEOUT"; do
+	is_integer "$VALUE" || unknown "-w, -c and -t take a number of seconds, not '$VALUE'"
+done
+
+if [ -n "$USE_SSH" ] && [ -z "$REMOTE_HOST" ]; then
+	REMOTE_HOST=localhost
 fi
 
-ANALYZE_STR=$($SYSTEMD_ANALYZE_BIN time --no-pager 2>&1 | head -n 1)
 
-# convert boot time to seconds
-# Caution: The systemd timespan for boot time produced by "systemd-analze time" skip the seconds-term is seconds was zero but milliseconds was not, e.g. 01:00.350 is displayed as "1min 350ms"
-# So relying on position like that https://stackoverflow.com/a/30826886 does not work reliably
-#BOOT_TIME_SEC=$(echo ${ANALYZE_STR} | sed -e 's/^.*= //' -e 's/min//' -e 's/s//' | awk '{print (NF>2?$(NF-2)*3600:0)+(NF>1?$(NF-1)*60:0)+$(NF)}')
-# Resort to FinishedTimestampMonotonic from systemctl show which produce time in microseconds as int.
-BOOT_TIME_SEC=$(echo $($SYSTEMCTL_BIN show --no-pager | grep -E "^FinishTimestampMonotonic=") | awk -F "=" '{print $2 /1000000}')
+# query systemd: the time the boot finished, then the loaded units
+# with -s, both in one ssh connection
+QUERY="systemctl show --no-pager -p FinishTimestampMonotonic && systemctl list-units --no-pager --no-legend --full"
+ERR_FILE=$(mktemp) || unknown "cannot create a temporary file"
+trap 'rm -f "$ERR_FILE"' EXIT
 
-# round toward zero since float compares are hard in bash
-BOOT_TIME_SEC_ROUND=$(echo $BOOT_TIME_SEC | sed -e 's/\..*$//' -e 's/,.*$//')
+if [ -n "$USE_SSH" ]; then
+	# BatchMode: fail instead of asking for a password or a host key
+	OUTPUT=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT" "$REMOTE_HOST" "$QUERY" 2>"$ERR_FILE")
+	RC=$?
+elif [ -n "$REMOTE_HOST" ]; then
+	OUTPUT=$(systemctl -H "$REMOTE_HOST" show --no-pager -p FinishTimestampMonotonic 2>"$ERR_FILE" &&
+		systemctl -H "$REMOTE_HOST" list-units --no-pager --no-legend --full 2>"$ERR_FILE")
+	RC=$?
+else
+	OUTPUT=$(systemctl show --no-pager -p FinishTimestampMonotonic 2>"$ERR_FILE" &&
+		systemctl list-units --no-pager --no-legend --full 2>"$ERR_FILE")
+	RC=$?
+fi
+
+if [ $RC -ne 0 ]; then
+	ERROR=$(grep -v '^[[:space:]]*$' "$ERR_FILE" | head -n 1)
+	unknown "cannot query systemd${REMOTE_HOST:+ on $REMOTE_HOST}: ${ERROR:-exit code $RC}"
+fi
+
+
+# boot time in microseconds since the kernel started, 0 while still booting
+BOOT_TIME_USEC=$(sed -n 's/^FinishTimestampMonotonic=//p' <<< "$OUTPUT" | head -n 1)
+is_integer "$BOOT_TIME_USEC" || unknown "cannot read the boot time from '$(head -n 1 <<< "$OUTPUT")'"
+
+# columns: UNIT LOAD ACTIVE SUB DESCRIPTION; failed units may be marked with a leading ●, × or *
+UNITS=$(grep -v '^FinishTimestampMonotonic=' <<< "$OUTPUT" | awk 'NF {
+	i = ($1 == "●" || $1 == "×" || $1 == "*") ? 2 : 1
+	print $i, $(i + 2), $(i + 3)
+}')
+NUM_UNITS=$(grep -c . <<< "$UNITS")
+LST_FAILED_UNITS=$(awk '$2 == "failed" {print $1}' <<< "$UNITS")
+NUM_FAILED=$(grep -c . <<< "$LST_FAILED_UNITS")
+RUNNING_SERVICES=$(awk '$1 ~ /\.service$/ && $3 == "running" {print $1}' <<< "$UNITS")
+
+
+STATUS_STR=OK
+RET_VAL=$NAG_OK
+MESSAGES=()
+
+# raises the state, CRITICAL outranks UNKNOWN outranks WARNING
+# raise_state STATE
+raise_state(){
+	case "$1" in
+		$NAG_CRIT) STATUS_STR=CRITICAL; RET_VAL=$NAG_CRIT ;;
+		$NAG_UNKNOWN) [ $RET_VAL -ne $NAG_CRIT ] && { STATUS_STR=UNKNOWN; RET_VAL=$NAG_UNKNOWN; } ;;
+		$NAG_WARN) [ $RET_VAL -eq $NAG_OK ] && { STATUS_STR=WARNING; RET_VAL=$NAG_WARN; } ;;
+	esac
+}
+
+if [ "$NUM_FAILED" -gt 0 ]; then
+	raise_state $NAG_CRIT
+	MESSAGES+=("Failed units: $(tr '\n' ' ' <<< "$LST_FAILED_UNITS" | sed 's/ $//')")
+fi
+
+# services given with -a have to be running
+NUM_FOUND=0
+NUM_MISSING=0
+MISSING_SERVICES=""
+for SERVICE in "${REQUIRED_SERVICES[@]}"; do
+	[ -n "$SERVICE" ] || continue
+	if grep -qxF "${SERVICE}.service" <<< "$RUNNING_SERVICES"; then
+		NUM_FOUND=$((NUM_FOUND + 1))
+	else
+		NUM_MISSING=$((NUM_MISSING + 1))
+		MISSING_SERVICES="$MISSING_SERVICES ${SERVICE}.service"
+	fi
+done
+if [ $NUM_MISSING -gt 0 ]; then
+	raise_state $NAG_CRIT
+	MESSAGES+=("Missing services:$MISSING_SERVICES")
+fi
 
 # compare boot time to limits
-if [ $BOOT_TIME_SEC_ROUND -gt $BOOT_TIME_WARN_SEC ]; then
-        BOOT_TIME_STR="Boot time exceeded ${BOOT_TIME_WARN_SEC}s, "
-        STATUS_STR=WARNING
-        RET_VAL=$NAG_WARN
-fi
-
-if [ $BOOT_TIME_SEC_ROUND -gt $BOOT_TIME_CRIT_SEC ]; then
-        BOOT_TIME_STR="Boot time exceeded ${BOOT_TIME_WARN_SEC}s, "
-        STATUS_STR=CRITICAL
-        RET_VAL=$NAG_CRIT
-fi
-
-# if something failed with systemd-analyze (e.g. system is not yet booted completely), print error
-if [ ! $BOOT_TIME_SEC_ROUND -gt 0 ]; then
-        BOOT_TIME_STR=$ANALYZE_STR
-        STATUS_STR=UNKNOWN
-        RET_VAL=$NAG_UNKNOWN
-fi
-
-# get list of failed units
-# on some version of systemd, $1 is '●'
-RESULT=$($SYSTEMCTL_BIN list-units --failed --full --no-legend --no-pager)
-if [[ "${RESULT}" == "●"* ]]; then
-        LST_FAILED_UNITS=$(awk '{print $2}' <<< "$RESULT")
+PERF_BOOT=""
+if [ "$BOOT_TIME_USEC" -eq 0 ]; then
+	raise_state $NAG_UNKNOWN
+	MESSAGES+=("Boot has not finished yet")
 else
-        LST_FAILED_UNITS=$(awk '{print $1}' <<< "$RESULT")
+	BOOT_TIME_SEC_ROUND=$((BOOT_TIME_USEC / 1000000))
+	BOOT_TIME_SEC=$(LC_ALL=C awk -v usec="$BOOT_TIME_USEC" 'BEGIN { printf "%.3f", usec / 1000000 }')
+	if [ $BOOT_TIME_SEC_ROUND -gt $BOOT_TIME_CRIT_SEC ]; then
+		raise_state $NAG_CRIT
+		MESSAGES+=("Boot time ${BOOT_TIME_SEC}s exceeded ${BOOT_TIME_CRIT_SEC}s")
+	elif [ $BOOT_TIME_SEC_ROUND -gt $BOOT_TIME_WARN_SEC ]; then
+		raise_state $NAG_WARN
+		MESSAGES+=("Boot time ${BOOT_TIME_SEC}s exceeded ${BOOT_TIME_WARN_SEC}s")
+	else
+		MESSAGES+=("Boot took ${BOOT_TIME_SEC}s")
+	fi
+	PERF_BOOT=" startup_time=${BOOT_TIME_SEC}s;${BOOT_TIME_WARN_SEC};${BOOT_TIME_CRIT_SEC};0"
 fi
-#>sudo -u nagios systemctl -H debian-xmpp.private.lan list-units --failed --full --no-legend --no-pager
-#block-badips-onboot.service loaded failed failed Applies iptables rules to block known IPs doing nasty stuff"
-#block-badips-timer.service  loaded failed failed Timer service for running block badips script periodically 
-
-# assemble list of failed units as human readable string
-if [ ! -z "$LST_FAILED_UNITS" ]; then
-        NUM_FAILED=$(printf '%s\n' $LST_FAILED_UNITS | wc -l)
-        STATUS_STR=CRITICAL
-        FAILED_UNITS_STR="Failed units: $LST_FAILED_UNITS, "
-        RET_VAL=$NAG_CRIT
-fi
-
-# get total number of units
-NUM_UNITS=$($SYSTEMCTL_BIN list-units --no-pager --no-legend | wc -l)
-
-# get list of running services
-RUNNING_SERVICES=$($SYSTEMCTL_BIN list-units --type=service --state=running --no-pager --no-legend | awk '{print $1}')
-NUM_F=0
-NUM_NF=0
-MISSING_SERVICE_STR=""
-for val in "${multi[@]}"; do
-        if [ ! -z "${val}" ]; then ## check for emptiness, otherwise grep produces an error
-                if grep -q ^${val}.service <<<${RUNNING_SERVICES} ; then
-        #               echo $val found in ${TMP_FILE}
-                        F="$F $val"
-                        NUM_F=$((NUM_F + 1))
-                else
-        #               echo $val NOT found in ${TMP_FILE}
-                        NF="$NF $val"
-                        NUM_NF=$((NUM_NF + 1))
-                        STATUS_STR=CRITICAL
-                        RET_VAL=$NAG_CRIT
-                        if [ -z "$MISSING_SERVICES_STR" ]; then
-                                MISSING_SERVICES_STR="Missing services "
-                        fi
-                        MISSING_SERVICES_STR="$MISSING_SERVICES_STR${val}.service "
-                fi
-        fi
-done
 
 
 # assemble output string
-# sample output of check_systemd (python reference implementation) 
+# sample output of check_systemd (python reference implementation)
 # |count_units=312 startup_time=175.857;60;120 units_activating=0 units_active=219 units_failed=0 units_inactive=93
-echo $STATUS_STR - ${FAILED_UNITS_STR}${MISSING_SERVICES_STR}${BOOT_TIME_STR}${ANALYZE_STR}$PERF_DATA"|count_units=${NUM_UNITS} startup_time=${BOOT_TIME_SEC} units_failed=${NUM_FAILED} services_found=${NUM_F}  services_missing=${NUM_NF}"
+MESSAGE=$(printf '%s, ' "${MESSAGES[@]}")
+printf '%s - %s|count_units=%s%s units_failed=%s services_found=%s services_missing=%s\n' \
+	"$STATUS_STR" "${MESSAGE%, }" "$NUM_UNITS" "$PERF_BOOT" "$NUM_FAILED" "$NUM_FOUND" "$NUM_MISSING"
 
-# reset trap
-trap EXIT
 exit $RET_VAL
-
