@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (C) Thomas Wagner <wagner-thomas@gmx.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 set -o errexit
 

@@ -19,3 +19,7 @@ check_systemd.sh -H monitor@server.example.com -s -a sshd -a postfix
 
 Any failed unit and any service given with `-a` that is not running is
 CRITICAL. The monitoring user needs key based ssh access to the machine.
+
+## License
+
+GPL-2.0-or-later, see [LICENSE](LICENSE).
